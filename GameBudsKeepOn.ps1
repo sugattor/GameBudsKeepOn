@@ -18,7 +18,8 @@
     実測で分かった制約。
       読み取りは 1 プロセスで 1 回だけ通る。
       同じプロセスで 2 回読むと、2 回目以降は返事が来ない。
-      だから常駐は、点検のたびに短命のプロセスを 1 個立ち上げて読ませる。
+      だから読み取りは、この実行の中で 1 回にする。
+      書き込み後の確かめは、次の実行で分かる。
       書き込みは同じプロセスで繰り返しても USB に出る（10 本すべて実測）。
 
     Engine API の手順（GG の画面の「保存」と同じ 2 回送り）。
@@ -47,12 +48,6 @@
 .PARAMETER Channel
     経路。Auto、Engine、Hid の 3 つ。既定は Auto。
 
-.PARAMETER IntervalSeconds
-    常駐が点検する間隔の秒。既定は 300。
-
-.PARAMETER Watch
-    点検し続ける。
-
 .PARAMETER Force
     すでに決め値でも書き直す。
 
@@ -76,8 +71,6 @@ param(
     [string]$BaseUrl = '',
     [ValidateSet('Auto', 'Engine', 'Hid')]
     [string]$Channel = 'Auto',
-    [int]$IntervalSeconds = 300,
-    [switch]$Watch,
     [switch]$Force,
     [switch]$DryRun
 )
@@ -93,9 +86,6 @@ $DeviceName = 'arctis_gamebuds_dongle'
 $LogDir     = Join-Path $env:LOCALAPPDATA 'GameBudsKeepOn'
 $LogFile    = Join-Path $LogDir 'log.txt'
 $StateFile  = Join-Path $LogDir 'state.txt'
-# 点検 1 回の結果をここに出す。
-# 常駐はこのファイルを読んで次決める。標準出力の扱いに左右されないため。
-$ResultFile = Join-Path $LogDir 'last.txt'
 $MaxLogByte = 512 * 1024
 
 # HID の機器の識別。ドングルは 3 つのチャネルを出す。
@@ -568,7 +558,7 @@ function Write-HidMinutes {
 # 点検 1 回
 # ==================================================================
 
-# 機械が読む行。点検ごとにこのファイルへ書く。
+# 点検の結果の 1 行。画面へ出す。
 function Report-Poll {
     param(
         [string]$経路,
@@ -577,10 +567,9 @@ function Report-Poll {
         [bool]$書いた
     )
     $conn = if ($null -eq $接続) { '不明' } elseif ($接続) { 'はい' } else { 'いいえ' }
-    $line = 'POLL 経路={0} 接続={1} 現在={2} 目標={3} 書いた={4}' -f `
+    Write-Host ('POLL 経路={0} 接続={1} 現在={2} 目標={3} 書いた={4}' -f `
         $経路, $conn, $(if ($null -eq $現在) { '?' } else { $現在 }), $Minutes,
-        $(if ($書いた) { 'はい' } else { 'いいえ' })
-    Set-Content -LiteralPath $ResultFile -Value $line -Encoding utf8 -NoNewline
+        $(if ($書いた) { 'はい' } else { 'いいえ' }))
 }
 
 function Resolve-Channel {
@@ -704,7 +693,7 @@ function Poll-Hid {
     }
 
     # 同じプロセスで読み直しても返事は来ない（実測）。
-    # 確かめは次の点検に任せるので、少しあけて点検し直す。
+    # 確かめは、もう 1 回の実行で分かる。
     Write-State '書き込み済み'
     Write-Log ('状態=書き込み 自動電源オフ={0}←{1} 電池={2}' -f (Format-Minutes $Minutes), (Format-Minutes $st.分), $st.電池)
     Report-Poll 'Hid' $true $st.分 $true
@@ -746,91 +735,6 @@ if ($Minutes -notin $GgChoices) {
     Write-Warning ('{0} 分は GG の画面の候補に無い値です。画面では選択欄が空で出ますが、本体では効きます。' -f $Minutes)
 }
 
-if (-not $Watch) {
-    # 1 回の点検。常駐はこの形を点検ごとに呼び直す。
-    # 詰まっても終わるように、45 秒で外から終わらせる。
-    [Gamebud.Hid]::Watchdog(45000)
-    $code = Poll -ForceNow ([bool]$Force)
-    if (Test-Path -LiteralPath $ResultFile) {
-        Write-Host (Get-Content -LiteralPath $ResultFile -Raw -Encoding utf8)
-    }
-    exit $code
-}
-
-# 常駐モード。タスク スケジューラも管理者の権限も要らない。
-Write-Log ('状態=開始 常駐 目標={0} 間隔={1}秒 経路={2}' -f $Minutes, $IntervalSeconds, $Channel)
-
-$self    = Join-Path $PSHOME 'pwsh.exe'
-$script  = $PSCommandPath
-$prevConn = $null
-$due      = [System.Collections.Generic.List[datetime]]::new()
-$first    = $true
-# 状態が変わらない日はログが一行も増えず、止まっているのか判別できない。
-# 1 時間に 1 回、生きている証拠を残す。
-$beat = Get-Date
-
-while ($true) {
-    # 予定が入っているときはそこだけ短く待つ。
-    # イヤホンを出した直後と、書き込んだ直後に、間を置いて何度も押す。
-    # 起動の 1 回目は待たずに調べる。
-    $nap = $IntervalSeconds
-    if ($due.Count -gt 0) {
-        $left = [int](($due[0] - (Get-Date)).TotalSeconds)
-        if ($left -lt $nap) { $nap = [Math]::Max(1, $left) }
-        $due.RemoveAt(0)
-    } elseif ($first) {
-        $nap = 10
-        $first = $false
-    }
-    Start-Sleep -Seconds ([Math]::Ceiling($nap))
-
-    $forceNow = ($prevConn -ne $true)
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script,
-                 '-Minutes', $Minutes, '-Channel', $Channel)
-    if ($forceNow) { $argList += '-Force' }
-
-    Remove-Item -LiteralPath $ResultFile -Force -ErrorAction SilentlyContinue
-    try {
-        & $self @argList | Out-Null
-    } catch {
-        Write-Log "状態=失敗 点検のプロセスが落ちた: $($_.Exception.Message)"
-    }
-
-    $line = $null
-    if (Test-Path -LiteralPath $ResultFile) {
-        $line = (Get-Content -LiteralPath $ResultFile -Raw -Encoding utf8).Trim()
-    }
-    if ([string]::IsNullOrWhiteSpace($line)) {
-        Write-Log '状態=失敗 点検が結果を書かない'
-        continue
-    }
-
-    $f = @{}
-    foreach ($kv in ($line.ToString() -split '\s+' | Where-Object { $_ -match '=' })) {
-        $k, $v = $kv -split '=', 2
-        $f[$k] = $v
-    }
-    $conn = switch ($f['接続']) { 'はい' { $true } 'いいえ' { $false } default { $null } }
-    $now  = if ($f['現在'] -eq '?') { $null } else { [int]$f['現在'] }
-
-    # 未接続から接続へ変わった直後は、何度でも書き直す。
-    # 本体が起動しきっていない回を追い越すため、15 秒と 45 秒後も予定に入れる。
-    if ($conn -eq $true -and $prevConn -ne $true) {
-        Write-Log ('状態=接続 もう一度書く予定を入れる 現在={0}' -f (Format-Minutes $now))
-        $due.Add((Get-Date).AddSeconds(15))
-        $due.Add((Get-Date).AddSeconds(45))
-    }
-    # 書き込んだ直後は、入り切っていないことがあるので確かめ直す。
-    if ($f['書いた'] -eq 'はい' -and $now -ne $Minutes) {
-        $due.Add((Get-Date).AddSeconds(20))
-    }
-    $prevConn = $conn
-
-    if ((Get-Date) -ge $beat) {
-        Write-Log ('状態=生存 目標={0} 経路={1} 接続={2} 現在={3}' -f `
-            $Minutes, $f['経路'], $f['接続'], (Format-Minutes $now))
-        $beat = (Get-Date).AddHours(1)
-    }
-}
-
-
+# 点検は読み取り 1 回で終わる。詰まっても終わるように、45 秒で外から終わらせる。
+[Gamebud.Hid]::Watchdog(45000)
+exit (Poll -ForceNow ([bool]$Force))
