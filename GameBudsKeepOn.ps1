@@ -9,7 +9,7 @@
        GG が動いているときだけ使える。
        GG の手元に保存されている設定も同時に直す。
     2. USB の HID へ直接書く
-       GG が無くても動く。ドングルへ 64 バイトの報告を 1 本送る。
+       GG が無くても動く。ドングルへ 64 バイトのレポートを 1 本送る。
 
     経路の選び方（既定は Auto）。
       GG のプロセスが居て、API のポートが見つかれば 1。
@@ -18,7 +18,7 @@
     実測で分かった制約。
       読み取りは 1 プロセスで 1 回だけ通る。
       同じプロセスで 2 回読むと、2 回目以降は返事が来ない。
-      だから常駐は、点検のたびに短命のプロセスを 1 回起こして読ませる。
+      だから常駐は、点検のたびに短命のプロセスを 1 個立ち上げて読ませる。
       書き込みは同じプロセスで繰り返しても USB に出る（10 本すべて実測）。
 
     Engine API の手順（GG の画面の「保存」と同じ 2 回送り）。
@@ -36,10 +36,10 @@
 
     HID の手順。
       1. 命令を送るチャネル（mi_03）を開く
-      2. キューを流し捨てる
-      3. 0xb0 を送る。報告の 12 番目のバイトが分数
+      2. キューを空にする
+      3. 0xb0 を送る。レポートの 12 番目のバイトが分数
       4. 分数が合わなければ 0xc1 と分数のバイトを送る
-      5. 窓を閉じる
+      5. ハンドルを閉じる
 
 .PARAMETER Minutes
     自動電源オフの分数。0 はなし。既定は 0。
@@ -102,8 +102,8 @@ $MaxLogByte = 512 * 1024
 # 命令を受け付けるチャネルは mi_03（実測で wIndex=3）。
 $HidMatch  = 'vid_1038&pid_230a'
 $HidIface  = 'mi_03'
-# 受け取りのバッファは一番長い報告に合わせて取る。
-# 64 バイトのバッファだと 512 バイトの報告で止まる（実測）。
+# 受け取りのバッファは一番長いレポートに合わせて取る。
+# 64 バイトのバッファだと 512 バイトのレポートで止まる（実測）。
 $HidBufLen = 513
 
 # ==================================================================
@@ -312,9 +312,9 @@ function Set-CurrentMinutes {
 function Get-DeviceSignature {
     param([int]$DeviceId)
 
-    # 本体へ直接聞く。GET /device/<ID> は Engine の手元のコピーで、
+    # 本体に直接問い合わせる。GET /device/<ID> は Engine の手元のコピーで、
     # イヤホンをしまってもしばらく接続済みのままなので使えない。
-    # 帰ってくる文字列の 5 番目にイヤホンの版が入る。
+    # 返ってくる文字列の 5 番目に、イヤホンのファームウェアのバージョンが入る。
     # 居ないときは 0.0.0 になる。実測で確かめた。
     $r = Invoke-Api POST ("/device/{0}/function/get_fw_version" -f $DeviceId) -Body '{}'
     if ($r.Status -ne 200) { return '不明' }
@@ -492,7 +492,7 @@ function Open-Hid([string]$Path) {
 }
 
 function Send-HidReport($h, [byte[]]$Payload) {
-    # 報告番号 0 を先頭に付ける。実測で GG と同じ形。
+    # レポート ID 0 を先頭に付ける。実測で GG と同じ形。
     $buf = New-Object byte[] 65
     $buf[0] = 0
     [Array]::Copy($Payload, 0, $buf, 1, [Math]::Min(64, $Payload.Length))
@@ -548,7 +548,7 @@ function Write-HidMinutes {
     $path = Find-HidPath
     if ($null -eq $path) { throw 'HID の機器が見つからない（ドングルが刺さっていない）' }
     $h = Open-Hid $path
-    if ($null -eq $h) { throw 'HID の窓が開けない' }
+    if ($null -eq $h) { throw 'HID のハンドルが開けない' }
     try {
         # GG は同じ命令を 2 回送る。同じ形にする。
         $payload = [byte[]]@(0xc1, [byte]$Value)
@@ -748,7 +748,7 @@ if ($Minutes -notin $GgChoices) {
 
 if (-not $Watch) {
     # 1 回の点検。常駐はこの形を点検ごとに呼び直す。
-    # 詰まっても終わるように、見張りを立てる。
+    # 詰まっても終わるように、45 秒で外から終わらせる。
     [Gamebud.Hid]::Watchdog(45000)
     $code = Poll -ForceNow ([bool]$Force)
     if (Test-Path -LiteralPath $ResultFile) {
