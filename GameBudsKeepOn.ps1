@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Arctis GameBuds の自動電源オフを、決め値にそろえる。
 
@@ -42,6 +42,8 @@
       4. 分数が合わなければ 0xc1 と分数のバイトを送る
       5. ハンドルを閉じる
 
+    Windows PowerShell 5.1 と PowerShell 7 のどちらも動く。
+
 .PARAMETER Minutes
     自動電源オフの分数。0 はなし。既定は 0。
 
@@ -59,7 +61,6 @@
     .\GameBudsKeepOn.ps1 -Minutes 0
     .\GameBudsKeepOn.ps1 -Channel Hid -Minutes 30
 #>
-#Requires -PSEdition Core
 
 [CmdletBinding()]
 param(
@@ -72,10 +73,41 @@ param(
     [ValidateSet('Auto', 'Engine', 'Hid')]
     [string]$Channel = 'Auto',
     [switch]$Force,
-    [switch]$DryRun
+    [switch]$DryRun,
+    # 内部用。新プロセスから状態を 1 回読む呼び出し。
+    [switch]$ProbeStatus
 )
 
 $ErrorActionPreference = 'Stop'
+
+$script:IsCore = ($PSVersionTable.PSEdition -eq 'Core')
+if (-not $script:IsCore) {
+    # 5.1 には Invoke-WebRequest の -SkipCertificateCheck が無い。
+    # TLS 1.2 を通す。
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # 5.1 は PUT と POST の本文を送る前に Expect: 100-continue を出す。切る。
+    [Net.ServicePointManager]::Expect100Continue = $false
+    # 5.1 で自己署名の証明書を許す。
+    # ScriptBlock 版の ServerCertificateValidationCallback は、
+    # .NET のスレッドから呼ばれたときに実行空間が無く失敗する(実測)。
+    # 5.1 で動く ICertificatePolicy を使う。
+    if (-not ('Gamebud.TrustAllCert' -as [type])) {
+        Add-Type -TypeDefinition @'
+namespace Gamebud {
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCert : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
+                                      WebRequest req, int problem) {
+        return true;
+    }
+}
+}
+'@
+    }
+    [Net.ServicePointManager]::CertificatePolicy = New-Object Gamebud.TrustAllCert
+}
 
 # Engine の API のポートは、再起動のたびに変わる。実測で確かめた。
 # 2026-11-22 の朝は 64255、同じ日の再起動後は 60845 だった。
@@ -126,7 +158,9 @@ function Write-State {
         $old = (Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue)
     }
     if ($old -ne $State) {
-        Set-Content -LiteralPath $StateFile -Value $State -Encoding utf8 -NoNewline
+        # BOM 付き UTF-8 で改行無しに書く。5.1 の Set-Content には -NoNewline が無い。
+        # BOM を付けるのは 5.1 が BOM の無い UTF-8 を正しく読めないため。
+        [System.IO.File]::WriteAllText($StateFile, $State, (New-Object System.Text.UTF8Encoding $true))
         return $true
     }
     return $false
@@ -139,12 +173,20 @@ function Format-Minutes {
     return "$Value 分"
 }
 
+# 電池は '左,右' の文字列で受ける。1 番目が左、2 番目が右。
+function Format-Battery {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '読めず' }
+    $v = $Value -split ','
+    return ('左{0}%,右{1}%' -f $v[0], $v[1])
+}
+
 # ==================================================================
 # 経路 1: SteelSeries GG の Engine API
 # ==================================================================
 
 # Engine は自己署名の証明書を出す。検証を捨てる。
-# PowerShell 7 の -SkipCertificateCheck を使う。
+# 捨て方は版で違う。冒頭の分岐で決める。
 function Test-EngineEndpoint {
     param([int]$Port)
 
@@ -152,9 +194,15 @@ function Test-EngineEndpoint {
     # 他のポートは 404 か、SSL が通らないので区別できる。実測で確かめた。
     try {
         $u = ("https://127.0.0.1:{0}/v1/connectedDevices" -f $Port)
-        $r = Invoke-WebRequest -Uri $u -SkipCertificateCheck `
-              -Headers @{ Origin = ("https://127.0.0.1:{0}" -f $Port); Accept = 'application/json' } `
-              -TimeoutSec 4 -ErrorAction Stop
+        $opt = @{
+            Uri             = $u
+            Headers         = @{ Origin = ("https://127.0.0.1:{0}" -f $Port); Accept = 'application/json' }
+            TimeoutSec      = 4
+            ErrorAction     = 'Stop'
+            UseBasicParsing = $true
+        }
+        if ($script:IsCore) { $opt.SkipCertificateCheck = $true }
+        $r = Invoke-WebRequest @opt
         return ([int]$r.StatusCode -eq 200 -and $r.Content -match '"devices"')
     } catch {
         return $false
@@ -180,7 +228,7 @@ function Find-BaseUrl {
     return $null
 }
 
-function Ensure-Endpoint {
+function Resolve-Endpoint {
     if ($script:BaseUrl) { return $true }
     $u = Find-BaseUrl
     if ($null -eq $u) { return $false }
@@ -200,11 +248,12 @@ function Invoke-Api {
     $opt = @{
         Uri                  = $script:BaseUrl + $Path
         Method               = $Method
-        SkipCertificateCheck = $true
         Headers              = @{ Origin = $script:BaseUrl; Accept = 'application/json' }
         TimeoutSec           = 20
         ErrorAction          = 'Stop'
+        UseBasicParsing      = $true
     }
+    if ($script:IsCore) { $opt.SkipCertificateCheck = $true }
     if ($null -ne $Body) {
         $json = if ($Body -is [string]) { $Body }
                 else { $Body | ConvertTo-Json -Depth 12 -Compress }
@@ -424,14 +473,25 @@ public static class Hid {
     public static extern bool HidD_FlushQueue(SafeFileHandle h);
 
     // 詰まっても必ず終わるようにする。点検は待ったまま残ってはいけない。
+    // 点検が予定通り終わったら Stop で止める。止めないと
+    // 対話のシェルをシェルごと終わらせる（実測）。
+    static ManualResetEvent s_stop = new ManualResetEvent(true);
+
     public static void Watchdog(int ms) {
+        ManualResetEvent stop = new ManualResetEvent(false);
+        s_stop = stop;
         Thread t = new Thread(() => {
-            Thread.Sleep(ms);
-            Console.Error.WriteLine("時間切れで終えた");
-            Environment.Exit(3);
+            if (!stop.WaitOne(ms)) {
+                Console.Error.WriteLine("GameBuds(USBドングル)からの返事が" + (ms / 1000) + "秒来ないので中止。ドングルが刺さっているか確認");
+                Environment.Exit(3);
+            }
         });
         t.IsBackground = true;
         t.Start();
+    }
+
+    public static void Stop() {
+        s_stop.Set();
     }
 
     public static System.Collections.Generic.List<string> Enumerate() {
@@ -513,7 +573,7 @@ function Read-HidStatus {
                                       接続 = $null; 分 = $null; 電池 = ''; 状態 = "返事なし=$err" }
         }
         # 4番目と5番目はイヤホンの状態。3 は取り出して接続（実測）。
-        # 6番目と7番目は電池。12番目が自動電源オフの分数。
+        # 6番目と7番目は電池。1番目が左、2番目が右(GG の画面と照合済み)。12番目が自動電源オフの分数。
         $connected = ($r[4] -eq 3 -and $r[5] -eq 3)
         return [pscustomobject]@{
             経路     = 'Hid'
@@ -558,18 +618,51 @@ function Write-HidMinutes {
 # 点検 1 回
 # ==================================================================
 
-# 点検の結果の 1 行。画面へ出す。
-function Report-Poll {
+# 実行結果の 1 行。画面へ出す。
+# 変更前は実行時に読み取った自動電源オフ。読めなければ -。
+# 変更後は書き換えた後の値。書き換えて無ければ -。
+# HID は同じ実行で読み直せない(実測)ので、HID の変更後は送った値。
+# 確かめは次の実行の変更前で見える。
+# 電池は経路がどちらでも USB 直接の読み取りで取る。読めなければ 読めず。
+function Show-Poll {
     param(
         [string]$経路,
         $接続,
-        $現在,
-        [bool]$書いた
+        $変更前,
+        [bool]$書いた,
+        $変更後,
+        [string]$電池 = ''
     )
     $conn = if ($null -eq $接続) { '不明' } elseif ($接続) { 'はい' } else { 'いいえ' }
-    Write-Host ('POLL 経路={0} 接続={1} 現在={2} 目標={3} 書いた={4}' -f `
-        $経路, $conn, $(if ($null -eq $現在) { '?' } else { $現在 }), $Minutes,
-        $(if ($書いた) { 'はい' } else { 'いいえ' }))
+    $pre = if ($null -eq $変更前) { '-' } else { [string]$変更前 }
+    $post = if ($書いた -and $null -ne $変更後) { [string]$変更後 } else { '-' }
+    $bat = Format-Battery $電池
+    Write-Host ('経路={0} 接続={1} 変更前={2} 目標={3} 変更後={4} 電池={5}' -f `
+        $経路, $conn, $pre, $Minutes, $post, $bat)
+}
+
+# GG との取り合いで返事を逃したときの新プロセス。
+# 同じプロセスでのやり直しは効かない(実測)ので、必ず新しいプロセスで 1 回だけ読ませる。
+# STATUS 行を受け取って状態の物にする。取れなければ null。
+function Read-HidStatusByNewProcess {
+    try {
+        $ps = (Get-Process -Id $PID).Path
+        $out = & $ps -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ProbeStatus 2>$null
+        $line = @($out | Where-Object { $_ -match '^STATUS ' }) | Select-Object -Last 1
+        if (-not $line) { return $null }
+        $kv = @{}
+        foreach ($m in [regex]::Matches($line.Trim(), '(\w)=([^\s]*)')) {
+            $kv[$m.Groups[1].Value] = $m.Groups[2].Value
+        }
+        return [pscustomobject]@{
+            見つかる = ($kv.F -eq '1')
+            返事     = ($kv.R -eq '1')
+            接続     = if ($kv.C -eq '1') { $true } elseif ($kv.C -eq '0') { $false } else { $null }
+            分       = if ($kv.M -match '^\d+$') { [int]$kv.M } else { $null }
+            電池     = [string]$kv.B
+            状態     = [string]$kv.S
+        }
+    } catch { return $null }
 }
 
 function Resolve-Channel {
@@ -577,27 +670,27 @@ function Resolve-Channel {
     # GG が動いているときだけ Engine を試す。見つからなければ HID。
     $gg = @(Get-Process -ErrorAction SilentlyContinue |
             Where-Object { $_.ProcessName -like 'SteelSeries*' })
-    if ($gg.Count -gt 0 -and (Ensure-Endpoint)) { return 'Engine' }
+    if ($gg.Count -gt 0 -and (Resolve-Endpoint)) { return 'Engine' }
     return 'Hid'
 }
 
-function Poll-Engine {
+function Invoke-PollEngine {
     param([bool]$ForceNow)
 
     # GG が起動していないと、ここで行く先が決まらない。
     # 分かりにくい URI のエラーではなく、理由を一行で残す。
-    if (-not $script:BaseUrl -and -not (Ensure-Endpoint)) {
+    if (-not $script:BaseUrl -and -not (Resolve-Endpoint)) {
         if (Write-State '失敗') {
             Write-Log '状態=失敗 Engine のポートが見つからない。GG を開くか -Channel Hid を使う'
         }
-        Report-Poll 'Engine' $null $null $false
+        Show-Poll 'Engine' $null $null $false
         return 1
     }
 
     $dev = Get-ConnectedDevice
     if ($null -eq $dev) {
         if (Write-State '未接続') { Write-Log '状態=未接続 ドングルを認識していない' }
-        Report-Poll 'Engine' $false $null $false
+        Show-Poll 'Engine' $false $null $false
         return 0
     }
 
@@ -605,21 +698,36 @@ function Poll-Engine {
     $present = Test-BudsPresent -Signature $sig
     if (-not $present) {
         if (Write-State 'イヤホン未接続') { Write-Log '状態=イヤホン未接続' }
-        Report-Poll 'Engine' $false $null $false
+        Show-Poll 'Engine' $false $null $false
         return 0
+    }
+
+    # GG 経由でも電池は HID から読む。HID は GG と共有して開けられる（実測）。
+    # ここがこの実行で唯一の読み取りになる。
+    # GG がドングルを覗いているとき、返事を GG に先取りされることがある。
+    # そのときはこの実行では読めない(プロセス内のやり直しは効かない・実測)ので、
+    # 新プロセスで 1 回だけ読み直す。
+    $bat = ''
+    try {
+        $hs = Read-HidStatus
+        if ($hs.返事) { $bat = $hs.電池 }
+    } catch { }
+    if ([string]::IsNullOrWhiteSpace($bat)) {
+        $hs2 = Read-HidStatusByNewProcess
+        if ($hs2 -and $hs2.返事) { $bat = $hs2.電池 }
     }
 
     $cfg = Get-ActiveConfig -DeviceId $dev.id
     $now = Get-CurrentMinutes -Config $cfg
     if ($null -eq $now) {
         Write-Log "状態=失敗 設定項目 inactivity_timer が見つからない: device=$($dev.id)"
-        Report-Poll 'Engine' $true $null $false
+        Show-Poll 'Engine' $true $null $false -電池 $bat
         return 1
     }
 
     if ($DryRun) {
-        Write-Log ('状態=試行 自動電源オフ={0} 目標={1}' -f (Format-Minutes $now), $Minutes)
-        Report-Poll 'Engine' $true $now $false
+        Write-Log ('状態=試行 自動電源オフ={0} 目標={1} 電池={2}' -f (Format-Minutes $now), $Minutes, (Format-Battery $bat))
+        Show-Poll 'Engine' $true $now $false -電池 $bat
         return 0
     }
 
@@ -627,7 +735,7 @@ function Poll-Engine {
         if (Write-State "設定済み=$Minutes") {
             Write-Log ('状態=済み 自動電源オフ={0}' -f (Format-Minutes $now))
         }
-        Report-Poll 'Engine' $true $now $false
+        Show-Poll 'Engine' $true $now $false -電池 $bat
         return 0
     }
 
@@ -636,49 +744,55 @@ function Poll-Engine {
     $after = Get-CurrentMinutes -Config (Get-ActiveConfig -DeviceId $dev.id)
     if ($after -eq $Minutes) {
         Write-State "設定済み=$Minutes"
-        Write-Log ('状態=成功 自動電源オフ={0}' -f (Format-Minutes $after))
-        Report-Poll 'Engine' $true $after $true
+        Write-Log ('状態=成功 自動電源オフ={0} 電池={1}' -f (Format-Minutes $after), (Format-Battery $bat))
+        Show-Poll 'Engine' $true $now $true -変更後 $after -電池 $bat
         return 0
     }
 
     if (Write-State '失敗') {
         Write-Log ('状態=失敗 書き込み後に値が一致しない: 目標={0} 実際={1}' -f $Minutes, $after)
     }
-    Report-Poll 'Engine' $true $after $true
+    Show-Poll 'Engine' $true $now $true -変更後 $after -電池 $bat
     return 1
 }
 
-function Poll-Hid {
+function Invoke-PollHid {
     param([bool]$ForceNow)
 
     $st = Read-HidStatus
+    # GG が起動していると返事を先取りされることがある。
+    # 機器が見えているのに返事が無いときだけ、新プロセスで 1 回読み直す。
+    if ($st.見つかる -and -not $st.返事) {
+        $st2 = Read-HidStatusByNewProcess
+        if ($st2 -and $st2.返事) { $st = $st2 }
+    }
     if (-not $st.見つかる) {
         if (Write-State 'ドングル無し') { Write-Log '状態=ドングル無し USB に見えない' }
-        Report-Poll 'Hid' $false $null $false
+        Show-Poll 'Hid' $false $null $false
         return 1
     }
     if (-not $st.返事) {
         if (Write-State 'イヤホン未接続') { Write-Log ('状態=イヤホン未接続 ' + $st.状態) }
-        Report-Poll 'Hid' $false $null $false
+        Show-Poll 'Hid' $false $null $false
         return 0
     }
     if (-not $st.接続) {
         if (Write-State 'イヤホン未接続') { Write-Log ('状態=イヤホン未接続 状態=' + $st.状態) }
-        Report-Poll 'Hid' $false $st.分 $false
+        Show-Poll 'Hid' $false $st.分 $false -電池 $st.電池
         return 0
     }
 
     if ($DryRun) {
-        Write-Log ('状態=試行 自動電源オフ={0} 目標={1} 電池={2}' -f (Format-Minutes $st.分), $Minutes, $st.電池)
-        Report-Poll 'Hid' $true $st.分 $false
+        Write-Log ('状態=試行 自動電源オフ={0} 目標={1} 電池={2}' -f (Format-Minutes $st.分), $Minutes, (Format-Battery $st.電池))
+        Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 0
     }
 
     if ($st.分 -eq $Minutes -and -not $ForceNow) {
         if (Write-State "設定済み=$Minutes") {
-            Write-Log ('状態=済み 自動電源オフ={0} 電池={1}' -f (Format-Minutes $st.分), $st.電池)
+            Write-Log ('状態=済み 自動電源オフ={0} 電池={1}' -f (Format-Minutes $st.分), (Format-Battery $st.電池))
         }
-        Report-Poll 'Hid' $true $st.分 $false
+        Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 0
     }
 
@@ -688,36 +802,37 @@ function Poll-Hid {
         if (Write-State '失敗') {
             Write-Log "状態=失敗 HID の書き込み: $($_.Exception.Message)"
         }
-        Report-Poll 'Hid' $true $st.分 $false
+        Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 1
     }
 
     # 同じプロセスで読み直しても返事は来ない（実測）。
     # 確かめは、もう 1 回の実行で分かる。
+    # 変更後は送った値を出す。
     Write-State '書き込み済み'
-    Write-Log ('状態=書き込み 自動電源オフ={0}←{1} 電池={2}' -f (Format-Minutes $Minutes), (Format-Minutes $st.分), $st.電池)
-    Report-Poll 'Hid' $true $st.分 $true
+    Write-Log ('状態=書き込み 自動電源オフ={0}←{1} 電池={2}' -f (Format-Minutes $Minutes), (Format-Minutes $st.分), (Format-Battery $st.電池))
+    Show-Poll 'Hid' $true $st.分 $true -変更後 $Minutes -電池 $st.電池
     return 0
 }
 
-function Poll {
+function Invoke-Poll {
     param([bool]$ForceNow)
 
     $ch = Resolve-Channel
     if ($ch -eq 'Engine') {
         try {
-            return Poll-Engine -ForceNow $ForceNow
+            return Invoke-PollEngine -ForceNow $ForceNow
         } catch {
             if (Write-State '失敗') { Write-Log "状態=失敗 Engine: $($_.Exception.Message)" }
-            Report-Poll 'Engine' $null $null $false
+            Show-Poll 'Engine' $null $null $false
             return 1
         }
     }
     try {
-        return Poll-Hid -ForceNow $ForceNow
+        return Invoke-PollHid -ForceNow $ForceNow
     } catch {
         if (Write-State '失敗') { Write-Log "状態=失敗 HID: $($_.Exception.Message)" }
-        Report-Poll 'Hid' $null $null $false
+        Show-Poll 'Hid' $null $null $false
         return 1
     }
 }
@@ -728,6 +843,16 @@ function Poll {
 
 Initialize-Log
 
+# -ProbeStatus は新プロセスからの呼ばれ方。状態を 1 行出して終わる。
+if ($ProbeStatus) {
+    $st = Read-HidStatus
+    $c = if ($null -eq $st.接続) { '?' } elseif ($st.接続) { '1' } else { '0' }
+    $m = if ($null -eq $st.分) { '?' } else { [string]$st.分 }
+    Write-Output ('STATUS F={0} R={1} C={2} M={3} B={4} S={5}' -f `
+        [int]$st.見つかる, [int]$st.返事, $c, $m, $st.電池, $st.状態)
+    exit 0
+}
+
 # GG の画面に出る候補の一覧。ここに無い値のときだけ教える。
 $GgChoices = @(0, 1, 5, 10, 15, 30, 45, 60, 75, 90)
 if ($Minutes -notin $GgChoices) {
@@ -736,5 +861,8 @@ if ($Minutes -notin $GgChoices) {
 }
 
 # 点検は読み取り 1 回で終わる。詰まっても終わるように、45 秒で外から終わらせる。
+# 点検が終わったらウォッチドッグを止める。止めると対話のシェルはそのまま残る。
 [Gamebud.Hid]::Watchdog(45000)
-exit (Poll -ForceNow ([bool]$Force))
+$code = Invoke-Poll -ForceNow ([bool]$Force)
+[Gamebud.Hid]::Stop()
+exit $code

@@ -1,5 +1,4 @@
-#Requires -PSEdition Core
-<#
+﻿<#
 .SYNOPSIS
     ドングルと USB の HID で直接向き合うための探見本。
 
@@ -225,14 +224,24 @@ public static class Dongle {
     public static extern bool HidD_FreePreparsedData(IntPtr data);
 
     // 詰まっても必ず終わるようにする。読み取りはデータが無いと止まる。
+    // 正常に終わったら Stop で止める。止めないと対話のシェルをシェルごと終わらせる。
+    static ManualResetEvent s_stop = new ManualResetEvent(true);
+
     public static void Watchdog(int ms) {
+        ManualResetEvent stop = new ManualResetEvent(false);
+        s_stop = stop;
         Thread t = new Thread(() => {
-            Thread.Sleep(ms);
-            Console.Error.WriteLine("時間切れで終えた");
-            Environment.Exit(3);
+            if (!stop.WaitOne(ms)) {
+                Console.Error.WriteLine("USBデバイス(GameBudsドングル)からの返事が" + (ms / 1000) + "秒来ないので中止");
+                Environment.Exit(3);
+            }
         });
         t.IsBackground = true;
         t.Start();
+    }
+
+    public static void Stop() {
+        s_stop.Set();
     }
 
     public static List<string> Enumerate() {
@@ -306,7 +315,7 @@ function Open-Dongle([string]$Path) {
     # 重複読み取りを使うので FILE_FLAG_OVERLAPPED を付ける。
     $h = [Gamebud.Dongle]::CreateFile($Path, -1073741824, 3, [IntPtr]::Zero, 3, 1073741824, [IntPtr]::Zero)
     if ($null -eq $h -or $h.IsInvalid) {
-        Say ('  開けない GetLastError=' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        Say ('  HID インターフェースを開けなかった GetLastError=' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
         return $null
     }
     return $h
@@ -320,7 +329,7 @@ function Read-Reports($h, [int]$Len, [int]$Count) {
         $err = 0
         $r = [Gamebud.Dongle]::ReadTimeout($h, $Len, $ReadWaitMs, [ref]$err)
         if ($null -eq $r) {
-            Say ('  ここから読み取り無し GetLastError=' + $err)
+            Say ('  これ以上データが無いので読み取り中止 GetLastError=' + $err)
             break
         }
         $got.Add($r)
@@ -343,7 +352,7 @@ function Write-Report($h, [byte[]]$Body) {
 # 候補を引き当てる
 $paths = [Gamebud.Dongle]::Enumerate() | Where-Object { $_ -like "*$Match*" }
 if (-not $paths) {
-    Say "見つからない: $Match を含む HID が見つからない"
+    Say "見つからない: '$Match' を含む HID デバイスが見つからない。-Match を変えて試す。"
     exit 1
 }
 
@@ -378,7 +387,7 @@ $target = $cands |
     Select-Object -First 1
 if (-not $target) {
     Say ''
-    Say '出力報告 65 以上のものが見つからない。上の表を見て判断する。'
+    Say '命令を送れるインターフェースが見つからない。上の表の 出力 が 65 以上の行があれば、その行を -Match で指定する。'
     exit 1
 }
 
@@ -387,7 +396,7 @@ if (-not $target) {
 $ReadLen = [Math]::Max(513, [int]$target.入力報告)
 
 Say ''
-Say ('使う物: ' + $target.道)
+Say ('使う HID インターフェース: ' + $target.道)
 Say ('受け取りのバッファ: ' + $ReadLen + ' バイト')
 
 $limit = $TimeoutMs
@@ -396,6 +405,9 @@ if ($Do -eq '監視' -and $limit -lt ($Seconds + 12) * 1000) {
 }
 [Gamebud.Dongle]::Watchdog($limit)
 
+# どの分岐で exit しても finally でウォッチドッグを止める。止めないと対話のシェルが残らない。
+try {
+
 if ($Do -eq '一覧') {
     foreach ($c in $cands) { if ($c.handle -and -not $c.handle.IsInvalid) { $c.handle.Close() } }
     exit 0
@@ -403,12 +415,12 @@ if ($Do -eq '一覧') {
 
 # 受け取った報告の説明。
 # 読み取りのbufは 0 番目が報告番号で、実測の並びは 1 番目から始まる。
-function Explain-Report([byte[]]$r) {
+function Format-Report([byte[]]$r) {
     $kind = $r[1]
     $extra = ''
     if ($kind -eq 0xb0 -and $r.Count -ge 13) {
-        # 実測: 6番目と7番目は電池、12番目は自動電源オフの分
-        $extra = ('  【電池={0}%,{1}% 自動電源オフ={2}分】' -f $r[6], $r[7], $r[12])
+        # 実測: 6番目と7番目は電池(1番目が左、2番目が右。GG の画面と照合済み)、12番目は自動電源オフの分
+        $extra = ('  【電池=左{0}%,右{1}% 自動電源オフ={2}分】' -f $r[6], $r[7], $r[12])
     }
     $hex = ($r | ForEach-Object { '{0:x2}' -f $_ }) -join ''
     return ('  報告 0x{0:x2} 受け取り{1}バイト{2}  並び: {3}' -f $kind, $r.Length, $extra,
@@ -434,10 +446,10 @@ if ($Do -eq '監視') {
         $err = 0
         $r = $rd.Take($ReadWaitMs, [ref]$err)
         if ($null -ne $r -and $r.Length -ge 13 -and $r[1] -eq 0xb0) {
-            Say ('  {0}  状態={1:x2},{2:x2} 電池={3}%,{4}% 自動電源オフ={5}分' -f `
+            Say ('  {0}  状態={1:x2},{2:x2} 電池=左{3}%,右{4}% 自動電源オフ={5}分' -f `
                 (Get-Date -Format 'HH:mm:ss'), $r[4], $r[5], $r[6], $r[7], $r[12])
         } else {
-            Say ('  {0}  返事が無い 失敗番号={1}' -f (Get-Date -Format 'HH:mm:ss'), $err)
+            Say ('  {0}  ドングルからの返事が無い WaitForSingleObject の結果={1}' -f (Get-Date -Format 'HH:mm:ss'), $err)
         }
         $rd.Abort()
         $h.Close()
@@ -453,7 +465,7 @@ if ($Do -eq '状態') {
     Say ('命令 0xb0 を送った: 成功={0} 長さ={1} GetLastError={2}' -f $w.成功, $w.書いた, $w.失敗)
     $reports = Read-Reports $target.handle $ReadLen $ReadCount
     Say ('受け取った報告: ' + $reports.Count)
-    foreach ($r in $reports) { Say (Explain-Report $r) }
+    foreach ($r in $reports) { Say (Format-Report $r) }
     $target.handle.Close()
     exit 0
 }
@@ -486,9 +498,14 @@ if ($Do -eq '書込') {
     $w = Write-Report $target.handle $body
     Say ('命令 0xc1 値={0} を送った: 成功={1} 長さ={2} GetLastError={3}' -f $Minutes, $w.成功, $w.書いた, $w.失敗)
     $reports = Read-Reports $target.handle $ReadLen $ReadCount
-    foreach ($r in $reports) { Say (Explain-Report $r) }
+    foreach ($r in $reports) { Say (Format-Report $r) }
     $target.handle.Close()
     exit 0
+}
+
+}
+finally {
+    [Gamebud.Dongle]::Stop()
 }
 
 

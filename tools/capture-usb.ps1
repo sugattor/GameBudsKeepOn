@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     ドングルと PC のあいだの USB のやり取りを取り込む。
@@ -46,10 +46,10 @@ param(
     [string]$WriteValues = '',
     # 書き込みのあいだの間隔
     [int]$GapSeconds = 9,
-    # 書き込みの代わりに HID の探見本を走らせる。
+    # 書き込みの代わりに HID 直接読み書きツール(hid-dongle.ps1)を走らせる。
     # Engine の並びと比べるのが目的。0 以上でこの形に切り替わる。
     [int]$HidWrite = -1,
-    # HID の探見本で状態を問い続ける時間。
+    # HID 直接読み書きツールで状態を問い続ける時間。
     # 問いが USB に出ているか確かめるための形。0 以上でこの形に切り替わる。
     [int]$HidWatch = -1,
     [string]$HidProbe = (Join-Path $PSScriptRoot 'hid-dongle.ps1')
@@ -126,20 +126,20 @@ $alive = @($jobs | Where-Object { -not $_.HasExited })
 if ($alive.Count -eq 0) {
     throw 'USBPcapCMD がすぐ終わった。管理者で開いても捕捉できない可能性がある。'
 }
-Mark "取り込み開始 $($alive.Count) 本（うち $($jobs.Count - $alive.Count) 本は空きハブ）"
+Mark "取り込み開始: USB ハブ $($alive.Count) 個（うち $($jobs.Count - $alive.Count) 個は機器の繋がっていないハブ）"
 
 if ($HidWatch -ge 0) {
-    # HID で状態を問い続けているあいだ、USB の実物を取り込む。
-    Mark "HID で $HidWatch 秒 問い続ける"
+    # HID 経由で GameBuds の状態を問い続けているあいだ、USB の実物を取り込む。
+    Mark "HID で GameBuds の状態を $HidWatch 秒問い続ける"
     Start-Sleep -Seconds 4
     $pwshSelf = (Get-Process -Id $PID).Path
     & $pwshSelf -NoProfile -ExecutionPolicy Bypass -File $HidProbe -Do 監視 -Seconds $HidWatch -ReadWaitMs 1200 2>&1 |
         ForEach-Object { Mark ('    ' + $_) }
     Start-Sleep -Seconds 3
 } elseif ($HidWrite -ge 0) {
-    # HID の探見本を別プロセスで走らせる（同じプロセスで走らせると
-    # 探見本の時間切れ終了が取り込みまで巻き込む）。
-    Mark 'HID の探見本を走らせる'
+    # HID 直接読み書きツールを別プロセスで走らせる（同じプロセスで走らせると
+    # ツールの時間切れ終了が取り込みまで巻き込む）。
+    Mark 'HID 直接読み書きツール(hid-dongle.ps1)を走らせる'
     Start-Sleep -Seconds 6
     $pwshSelf = (Get-Process -Id $PID).Path
     Mark '  1 状態を読む'
@@ -158,7 +158,7 @@ if ($HidWatch -ge 0) {
         Mark "  $v 分を書き込む"
         try {
             & $App -Minutes $v -Force
-            Mark '    呼んだ'
+            Mark '    書き込みを呼んだ'
         } catch {
             Mark "    失敗: $($_.Exception.Message)"
         }
@@ -176,7 +176,7 @@ if ($HidWatch -ge 0) {
         Mark "  書き込みが失敗: $($_.Exception.Message)"
     }
 
-    Mark '3 ピープが鳴ります。イヤホンをケースへ入れて 10 秒、それから出してください'
+    Mark '3 警告音を鳴らします。イヤホンをケースへ入れて 10 秒、それから出してください'
     [Console]::Beep(880, 500)
     Mark '   40 秒のあいだにやってください'
     Start-Sleep -Seconds 40
@@ -200,4 +200,4 @@ foreach ($f in $files) {
 }
 Mark "時刻の記録: $Mark"
 Stop-Transcript | Out-Null
-Write-Host '0 バイト近いファイルは、そのハブに traffic が無い。ドングルは USB 3.0 のハブに出る。'
+Write-Host '0 バイトに近いファイルは、そのハブを通過した通信が無いということ。ドングルは USB 3.0 のハブに出る。'
