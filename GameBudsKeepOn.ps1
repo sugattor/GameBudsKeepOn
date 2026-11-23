@@ -15,32 +15,11 @@
       GG のプロセスが居て、API のポートが見つかれば 1。
       それ以外は 2。
 
-    実測で分かった制約。
-      読み取りは 1 プロセスで 1 回だけ通る。
-      同じプロセスで 2 回読むと、2 回目以降は返事が来ない。
-      だから読み取りは、この実行の中で 1 回にする。
-      書き込み後の確かめは、次の実行で分かる。
-      書き込みは同じプロセスで繰り返しても USB に出る（10 本すべて実測）。
+    HID の読み取りは 1 プロセスで 1 回だけ通る（実測）。
+    だから読み取りはこの実行の中で 1 回にする。
+    書き込み後の確かめは、次の実行の変更前で見る。
 
-    Engine API の手順（GG の画面の「保存」と同じ 2 回送り）。
-      1. GET  /v1/connectedDevices                 接続中か見る
-      2. GET  /device/<ID>/configurations          設定を読む
-      3. PUT  /configuration/<設定ID>              分数だけ書き換える
-      4. POST /configuration/<設定ID>/forceDeploy  有効化する
-      5. GET  /device/<ID>/configurations          読み直して確かめる
-
-    Engine API ではまった穴。
-      POST /configuration/liveDeploy  中身が空の応答を返すが、何も変わらない
-      POST /configuration             更新ではなく新規作成になり、設定が増える
-      POST /configuration/<ID>/deploy エラーになる。forceDeploy を使う
-      PUT の直後                      active が 0 に外れる
-
-    HID の手順。
-      1. 命令を送るチャネル（mi_03）を開く
-      2. キューを空にする
-      3. 0xb0 を送る。レポートの 12 番目のバイトが分数
-      4. 分数が合わなければ 0xc1 と分数のバイトを送る
-      5. ハンドルを閉じる
+    手順の詳細、Engine API で踏んだ穴、実測値は docs/memo.md に置く。
 
     Windows PowerShell 5.1 と PowerShell 7 のどちらも動く。
 
@@ -79,6 +58,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Invoke-WebRequest は進捗バーの描画が遅い(5.1 で顕著)。消す。
+$ProgressPreference = 'SilentlyContinue'
 
 $script:IsCore = ($PSVersionTable.PSEdition -eq 'Core')
 if (-not $script:IsCore) {
@@ -111,14 +92,10 @@ public class TrustAllCert : ICertificatePolicy {
 
 # Engine の API のポートは、再起動のたびに変わる。実測で確かめた。
 # 2026-11-22 の朝は 64255、同じ日の再起動後は 60845 だった。
-# だからポートを決め打ちせず、点検のたびに探す。
+# だからポートを決め打ちせず、実行のたびに探す。
 $script:BaseUrl = if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $null } else { $BaseUrl }
 
 $DeviceName = 'arctis_gamebuds_dongle'
-$LogDir     = Join-Path $env:LOCALAPPDATA 'GameBudsKeepOn'
-$LogFile    = Join-Path $LogDir 'log.txt'
-$StateFile  = Join-Path $LogDir 'state.txt'
-$MaxLogByte = 512 * 1024
 
 # HID の機器の識別。ドングルは 3 つのチャネルを出す。
 # 命令を受け付けるチャネルは mi_03（実測で wIndex=3）。
@@ -129,49 +106,8 @@ $HidIface  = 'mi_03'
 $HidBufLen = 513
 
 # ==================================================================
-# 記録
+# 表示の補助
 # ==================================================================
-
-function Initialize-Log {
-    if (-not (Test-Path -LiteralPath $LogDir)) {
-        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-    }
-    if ((Test-Path -LiteralPath $LogFile) -and
-        ((Get-Item -LiteralPath $LogFile).Length -gt $MaxLogByte)) {
-        Move-Item -LiteralPath $LogFile -Destination ($LogFile + '.old') -Force
-    }
-}
-
-function Write-Log {
-    param([string]$Text)
-    $line = '{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text
-    Add-Content -LiteralPath $LogFile -Value $line -Encoding utf8
-    Write-Information $line
-}
-
-# 状態をファイルに覚えて、変わる瞬間だけログに残す。
-# 点検を繰り返してもログが膨らまないようにするため。
-function Write-State {
-    param([string]$State)
-    $old = $null
-    if (Test-Path -LiteralPath $StateFile) {
-        $old = (Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue)
-    }
-    if ($old -ne $State) {
-        # BOM 付き UTF-8 で改行無しに書く。5.1 の Set-Content には -NoNewline が無い。
-        # BOM を付けるのは 5.1 が BOM の無い UTF-8 を正しく読めないため。
-        [System.IO.File]::WriteAllText($StateFile, $State, (New-Object System.Text.UTF8Encoding $true))
-        return $true
-    }
-    return $false
-}
-
-function Format-Minutes {
-    param($Value)
-    if ($null -eq $Value) { return '不明' }
-    if ($Value -eq 0) { return 'なし' }
-    return "$Value 分"
-}
 
 # 電池は '左,右' の文字列で受ける。1 番目が左、2 番目が右。
 function Format-Battery {
@@ -233,7 +169,7 @@ function Resolve-Endpoint {
     $u = Find-BaseUrl
     if ($null -eq $u) { return $false }
     $script:BaseUrl = $u
-    Write-Log ("状態=ポート発見 " + $u)
+    Write-Verbose ("Engine のポート: {0}" -f $u)
     return $true
 }
 
@@ -269,7 +205,7 @@ function Invoke-Api {
         $resp = $_.Exception.Response
         if ($null -eq $resp) {
             # 接続そのものができない。ポートが動いた可能性が高い。
-            # 次の点検で探し直させる。
+            # 次の実行で探し直させる。
             $script:BaseUrl = $null
             throw
         }
@@ -344,7 +280,7 @@ function Set-CurrentMinutes {
     # PUT の後に有効化が外れる。forceDeploy が必須。
     $r = Invoke-Api POST ("/configuration/{0}/forceDeploy" -f $Config.id) ([ordered]@{})
     if ($r.Status -ne 200 -or $r.Body -match '"error"') {
-        Write-Log "forceDeploy が失敗したが値は入った可能性が高い: HTTP $($r.Status) $($r.Body)"
+        Write-Warning "forceDeploy が失敗したが値は入った可能性が高い: HTTP $($r.Status) $($r.Body)"
     }
 }
 
@@ -472,8 +408,8 @@ public static class Hid {
     [DllImport("hid.dll", SetLastError = true)]
     public static extern bool HidD_FlushQueue(SafeFileHandle h);
 
-    // 詰まっても必ず終わるようにする。点検は待ったまま残ってはいけない。
-    // 点検が予定通り終わったら Stop で止める。止めないと
+    // 詰まっても必ず終わるようにする。実行は待ったまま残ってはいけない。
+    // 実行が予定通り終わったら Stop で止める。止めないと
     // 対話のシェルをシェルごと終わらせる（実測）。
     static ManualResetEvent s_stop = new ManualResetEvent(true);
 
@@ -615,7 +551,7 @@ function Write-HidMinutes {
 }
 
 # ==================================================================
-# 点検 1 回
+# 実行 1 回
 # ==================================================================
 
 # 実行結果の 1 行。画面へ出す。
@@ -678,18 +614,15 @@ function Invoke-PollEngine {
     param([bool]$ForceNow)
 
     # GG が起動していないと、ここで行く先が決まらない。
-    # 分かりにくい URI のエラーではなく、理由を一行で残す。
+    # 分かりにくい URI のエラーではなく、理由を一行で出す。
     if (-not $script:BaseUrl -and -not (Resolve-Endpoint)) {
-        if (Write-State '失敗') {
-            Write-Log '状態=失敗 Engine のポートが見つからない。GG を開くか -Channel Hid を使う'
-        }
+        Write-Host '理由=Engine のポートが見つからない。GG を開くか -Channel Hid を使う'
         Show-Poll 'Engine' $null $null $false
         return 1
     }
 
     $dev = Get-ConnectedDevice
     if ($null -eq $dev) {
-        if (Write-State '未接続') { Write-Log '状態=未接続 ドングルを認識していない' }
         Show-Poll 'Engine' $false $null $false
         return 0
     }
@@ -697,7 +630,6 @@ function Invoke-PollEngine {
     $sig = Get-DeviceSignature -DeviceId $dev.id
     $present = Test-BudsPresent -Signature $sig
     if (-not $present) {
-        if (Write-State 'イヤホン未接続') { Write-Log '状態=イヤホン未接続' }
         Show-Poll 'Engine' $false $null $false
         return 0
     }
@@ -720,21 +652,17 @@ function Invoke-PollEngine {
     $cfg = Get-ActiveConfig -DeviceId $dev.id
     $now = Get-CurrentMinutes -Config $cfg
     if ($null -eq $now) {
-        Write-Log "状態=失敗 設定項目 inactivity_timer が見つからない: device=$($dev.id)"
+        Write-Host ('理由=inactivity_timer の設定項目が見つからない: device={0}' -f $dev.id)
         Show-Poll 'Engine' $true $null $false -電池 $bat
         return 1
     }
 
     if ($DryRun) {
-        Write-Log ('状態=試行 自動電源オフ={0} 目標={1} 電池={2}' -f (Format-Minutes $now), $Minutes, (Format-Battery $bat))
         Show-Poll 'Engine' $true $now $false -電池 $bat
         return 0
     }
 
     if ($now -eq $Minutes -and -not $ForceNow) {
-        if (Write-State "設定済み=$Minutes") {
-            Write-Log ('状態=済み 自動電源オフ={0}' -f (Format-Minutes $now))
-        }
         Show-Poll 'Engine' $true $now $false -電池 $bat
         return 0
     }
@@ -743,15 +671,11 @@ function Invoke-PollEngine {
     Start-Sleep -Milliseconds 800
     $after = Get-CurrentMinutes -Config (Get-ActiveConfig -DeviceId $dev.id)
     if ($after -eq $Minutes) {
-        Write-State "設定済み=$Minutes"
-        Write-Log ('状態=成功 自動電源オフ={0} 電池={1}' -f (Format-Minutes $after), (Format-Battery $bat))
         Show-Poll 'Engine' $true $now $true -変更後 $after -電池 $bat
         return 0
     }
 
-    if (Write-State '失敗') {
-        Write-Log ('状態=失敗 書き込み後に値が一致しない: 目標={0} 実際={1}' -f $Minutes, $after)
-    }
+    Write-Host ('理由=書き込み後に値が一致しない: 目標={0} 実際={1}' -f $Minutes, $after)
     Show-Poll 'Engine' $true $now $true -変更後 $after -電池 $bat
     return 1
 }
@@ -767,31 +691,25 @@ function Invoke-PollHid {
         if ($st2 -and $st2.返事) { $st = $st2 }
     }
     if (-not $st.見つかる) {
-        if (Write-State 'ドングル無し') { Write-Log '状態=ドングル無し USB に見えない' }
+        Write-Host '理由=ドングルが USB に見えない。刺し直す'
         Show-Poll 'Hid' $false $null $false
         return 1
     }
     if (-not $st.返事) {
-        if (Write-State 'イヤホン未接続') { Write-Log ('状態=イヤホン未接続 ' + $st.状態) }
         Show-Poll 'Hid' $false $null $false
         return 0
     }
     if (-not $st.接続) {
-        if (Write-State 'イヤホン未接続') { Write-Log ('状態=イヤホン未接続 状態=' + $st.状態) }
         Show-Poll 'Hid' $false $st.分 $false -電池 $st.電池
         return 0
     }
 
     if ($DryRun) {
-        Write-Log ('状態=試行 自動電源オフ={0} 目標={1} 電池={2}' -f (Format-Minutes $st.分), $Minutes, (Format-Battery $st.電池))
         Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 0
     }
 
     if ($st.分 -eq $Minutes -and -not $ForceNow) {
-        if (Write-State "設定済み=$Minutes") {
-            Write-Log ('状態=済み 自動電源オフ={0} 電池={1}' -f (Format-Minutes $st.分), (Format-Battery $st.電池))
-        }
         Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 0
     }
@@ -799,9 +717,7 @@ function Invoke-PollHid {
     try {
         Write-HidMinutes -Value $Minutes
     } catch {
-        if (Write-State '失敗') {
-            Write-Log "状態=失敗 HID の書き込み: $($_.Exception.Message)"
-        }
+        Write-Host "理由=HID の書き込みが失敗: $($_.Exception.Message)"
         Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
         return 1
     }
@@ -809,8 +725,6 @@ function Invoke-PollHid {
     # 同じプロセスで読み直しても返事は来ない（実測）。
     # 確かめは、もう 1 回の実行で分かる。
     # 変更後は送った値を出す。
-    Write-State '書き込み済み'
-    Write-Log ('状態=書き込み 自動電源オフ={0}←{1} 電池={2}' -f (Format-Minutes $Minutes), (Format-Minutes $st.分), (Format-Battery $st.電池))
     Show-Poll 'Hid' $true $st.分 $true -変更後 $Minutes -電池 $st.電池
     return 0
 }
@@ -823,7 +737,7 @@ function Invoke-Poll {
         try {
             return Invoke-PollEngine -ForceNow $ForceNow
         } catch {
-            if (Write-State '失敗') { Write-Log "状態=失敗 Engine: $($_.Exception.Message)" }
+            Write-Host "理由=Engine の実行でエラー: $($_.Exception.Message)"
             Show-Poll 'Engine' $null $null $false
             return 1
         }
@@ -831,7 +745,7 @@ function Invoke-Poll {
     try {
         return Invoke-PollHid -ForceNow $ForceNow
     } catch {
-        if (Write-State '失敗') { Write-Log "状態=失敗 HID: $($_.Exception.Message)" }
+        Write-Host "理由=HID の実行でエラー: $($_.Exception.Message)"
         Show-Poll 'Hid' $null $null $false
         return 1
     }
@@ -840,8 +754,6 @@ function Invoke-Poll {
 # ==================================================================
 # ここから実行
 # ==================================================================
-
-Initialize-Log
 
 # -ProbeStatus は新プロセスからの呼ばれ方。状態を 1 行出して終わる。
 if ($ProbeStatus) {
@@ -856,13 +768,25 @@ if ($ProbeStatus) {
 # GG の画面に出る候補の一覧。ここに無い値のときだけ教える。
 $GgChoices = @(0, 1, 5, 10, 15, 30, 45, 60, 75, 90)
 if ($Minutes -notin $GgChoices) {
-    Write-Log ('状態=注意 目標={0} 分は GG の画面の候補に無い値' -f $Minutes)
     Write-Warning ('{0} 分は GG の画面の候補に無い値です。画面では選択欄が空で出ますが、本体では効きます。' -f $Minutes)
 }
 
-# 点検は読み取り 1 回で終わる。詰まっても終わるように、45 秒で外から終わらせる。
-# 点検が終わったらウォッチドッグを止める。止めると対話のシェルはそのまま残る。
+# 実行は読み取り 1 回で終わる。詰まっても終わるように、45 秒で外から終わらせる。
+# 実行が終わったらウォッチドッグを止める。止めると対話のシェルはそのまま残る。
 [Gamebud.Hid]::Watchdog(45000)
 $code = Invoke-Poll -ForceNow ([bool]$Force)
 [Gamebud.Hid]::Stop()
+
+# 結果を表示したあと、毎回キー待ちする。
+# 右クリック・ショートカット・.bat 経由では窓が一瞬で閉じて結果が見えない。
+# 端末からの実行でも同じで、終了後に画面が残る。
+# -ProbeStatus の子プロセスはこの上で終わるので、読み取りのたびに
+# ハングすることはない。
+# ウォッチドッグは止めた後に待つ。キー待ちのせいで終了を待たされない。
+# 入力がリダイレクトされた実行では ReadKey が失敗するので、
+# try/catch でつかんで待たずに終わる。
+Write-Host ''
+Write-Host '続行するには何かキーを押してください . . .'
+try { [Console]::ReadKey($true) | Out-Null } catch { }
+
 exit $code

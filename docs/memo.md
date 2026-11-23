@@ -197,7 +197,7 @@ GG は同じ命令を 2 回送る。アプリも 2 回送る形にした。
 | `Add-Type` の型を名前空間なしで宣言し、`Gamebud.` 付きで参照すると TypeNotFound(実測) | 宣言も `namespace Gamebud` で囲む |
 | 既定の TLS に 1.2 が無い環境がある | `SecurityProtocol` に Tls12 を足す |
 | PUT/POST が `Expect: 100-continue` を先に出し、Engine が応答しない | `Expect100Continue=$false` |
-| `Set-Content -NoNewline` が無い | `[System.IO.File]::WriteAllText` を使う |
+| `Invoke-WebRequest` の進捗バーの描画が遅い | `$ProgressPreference = 'SilentlyContinue'` |
 | BOM の無い UTF-8 の日本語を読み間違える | スクリプトファイルを BOM 付き UTF-8 で保存する |
 
 5.1 での実測(2026-11-23): Auto/Engine/Hid、読み取り、Engine 経由の書き込み(PUT+forceDeploy)、HID 経由の書き込みすべて成功。
