@@ -157,7 +157,7 @@ if ($HidWatch -ge 0) {
     foreach ($v in $Values) {
         Mark "  $v 分を書き込む"
         try {
-            & $App -Minutes $v -Force
+            & $App -Minutes $v
             Mark '    書き込みを呼んだ'
         } catch {
             Mark "    失敗: $($_.Exception.Message)"
@@ -170,7 +170,7 @@ if ($HidWatch -ge 0) {
 
     Mark '2 Engine 経由で書き込む'
     try {
-        & $App -Minutes 30 -Force
+        & $App -Minutes 30
         Mark '  書き込みを呼んだ'
     } catch {
         Mark "  書き込みが失敗: $($_.Exception.Message)"

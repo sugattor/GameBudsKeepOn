@@ -3,25 +3,9 @@
     Arctis GameBuds の自動電源オフを、決め値にそろえる。
 
 .DESCRIPTION
-    経路は二つ。どちらも管理者の権限は要らない。
-
-    1. SteelSeries GG の Engine が開いているローカル API
-       GG が動いているときだけ使える。
-       GG の手元に保存されている設定も同時に直す。
-    2. USB の HID へ直接書く
-       GG が無くても動く。ドングルへ 64 バイトのレポートを 1 本送る。
-
-    経路の選び方（既定は Auto）。
-      GG のプロセスが居て、API のポートが見つかれば 1。
-      それ以外は 2。
-
-    HID の読み取りは 1 プロセスで 1 回だけ通る（実測）。
-    だから読み取りはこの実行の中で 1 回にする。
-    書き込み後の確かめは、次の実行の変更前で見る。
-
-    手順の詳細、Engine API で踏んだ穴、実測値は docs/memo.md に置く。
-
-    Windows PowerShell 5.1 と PowerShell 7 のどちらも動く。
+    接続を確認し、目標の値を書く。接続できていなければ書かない。
+    GG が動いていれば GG 経由、無ければ USB の HID へ直接書く。
+    使い方と仕組みは README.md、実測の記録は docs/memo.md。
 
 .PARAMETER Minutes
     自動電源オフの分数。0 はなし。既定は 0。
@@ -29,15 +13,12 @@
 .PARAMETER Channel
     経路。Auto、Engine、Hid の 3 つ。既定は Auto。
 
-.PARAMETER Force
-    すでに決め値でも書き直す。
-
 .PARAMETER DryRun
     読むだけで書き込まない。
 
 .EXAMPLE
     .\GameBudsKeepOn.ps1 -DryRun
-    .\GameBudsKeepOn.ps1 -Minutes 0
+    .\GameBudsKeepOn.ps1 -Minutes 30
     .\GameBudsKeepOn.ps1 -Channel Hid -Minutes 30
 #>
 
@@ -46,12 +27,12 @@ param(
     # GG の画面に出る候補は 10 個だけ。
     # それでも本体は候補に無い値をそのまま受ける。3 分を入れて 181 秒で切れた。
     # だから広く通し、GG の候補に無い値のときだけ警告を出す。
-    [ValidateRange(0, 1440)]
+    # 上限は 255。HID は分数を 1 バイトで送るので、それ以上は本体に載らない。
+    [ValidateRange(0, 255)]
     [int]$Minutes = 0,
     [string]$BaseUrl = '',
     [ValidateSet('Auto', 'Engine', 'Hid')]
     [string]$Channel = 'Auto',
-    [switch]$Force,
     [switch]$DryRun,
     # 内部用。新プロセスから状態を 1 回読む呼び出し。
     [switch]$ProbeStatus
@@ -528,9 +509,6 @@ function Read-HidStatus {
 function Write-HidMinutes {
     param([int]$Value)
 
-    if ($Value -gt 255) {
-        throw ('HID で送れる分数は 255 まで。目標={0}' -f $Value)
-    }
     $path = Find-HidPath
     if ($null -eq $path) { throw 'HID の機器が見つからない（ドングルが刺さっていない）' }
     $h = Open-Hid $path
@@ -611,8 +589,6 @@ function Resolve-Channel {
 }
 
 function Invoke-PollEngine {
-    param([bool]$ForceNow)
-
     # GG が起動していないと、ここで行く先が決まらない。
     # 分かりにくい URI のエラーではなく、理由を一行で出す。
     if (-not $script:BaseUrl -and -not (Resolve-Endpoint)) {
@@ -662,11 +638,7 @@ function Invoke-PollEngine {
         return 0
     }
 
-    if ($now -eq $Minutes -and -not $ForceNow) {
-        Show-Poll 'Engine' $true $now $false -電池 $bat
-        return 0
-    }
-
+    # 現在と同じ値でも毎回書く。
     Set-CurrentMinutes -Config $cfg -DeviceId $dev.id -Value $Minutes
     Start-Sleep -Milliseconds 800
     $after = Get-CurrentMinutes -Config (Get-ActiveConfig -DeviceId $dev.id)
@@ -681,8 +653,6 @@ function Invoke-PollEngine {
 }
 
 function Invoke-PollHid {
-    param([bool]$ForceNow)
-
     $st = Read-HidStatus
     # GG が起動していると返事を先取りされることがある。
     # 機器が見えているのに返事が無いときだけ、新プロセスで 1 回読み直す。
@@ -709,11 +679,7 @@ function Invoke-PollHid {
         return 0
     }
 
-    if ($st.分 -eq $Minutes -and -not $ForceNow) {
-        Show-Poll 'Hid' $true $st.分 $false -電池 $st.電池
-        return 0
-    }
-
+    # 現在と同じ値でも毎回書く。
     try {
         Write-HidMinutes -Value $Minutes
     } catch {
@@ -730,12 +696,10 @@ function Invoke-PollHid {
 }
 
 function Invoke-Poll {
-    param([bool]$ForceNow)
-
     $ch = Resolve-Channel
     if ($ch -eq 'Engine') {
         try {
-            return Invoke-PollEngine -ForceNow $ForceNow
+            return Invoke-PollEngine
         } catch {
             Write-Host "理由=Engine の実行でエラー: $($_.Exception.Message)"
             Show-Poll 'Engine' $null $null $false
@@ -743,7 +707,7 @@ function Invoke-Poll {
         }
     }
     try {
-        return Invoke-PollHid -ForceNow $ForceNow
+        return Invoke-PollHid
     } catch {
         Write-Host "理由=HID の実行でエラー: $($_.Exception.Message)"
         Show-Poll 'Hid' $null $null $false
@@ -774,7 +738,7 @@ if ($Minutes -notin $GgChoices) {
 # 実行は読み取り 1 回で終わる。詰まっても終わるように、45 秒で外から終わらせる。
 # 実行が終わったらウォッチドッグを止める。止めると対話のシェルはそのまま残る。
 [Gamebud.Hid]::Watchdog(45000)
-$code = Invoke-Poll -ForceNow ([bool]$Force)
+$code = Invoke-Poll
 [Gamebud.Hid]::Stop()
 
 # 結果を表示したあと、毎回キー待ちする。

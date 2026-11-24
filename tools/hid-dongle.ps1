@@ -21,7 +21,8 @@
 param(
     [ValidateSet('一覧', '状態', '書込', '機能', '入力', '監視')]
     [string]$Do = '一覧',
-    [ValidateRange(0, 1440)]
+    # 上限は 255。書き込みは分数を 1 バイトで送るので、それ以上は載らない。
+    [ValidateRange(0, 255)]
     [int]$Minutes = 0,
     # 機器の並びから引き当てる語
     [string]$Match = '1038',
