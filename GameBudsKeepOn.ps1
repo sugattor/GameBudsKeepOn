@@ -4,6 +4,8 @@
 
 .DESCRIPTION
     接続を確認し、目標の値を書く。接続できていなければ書かない。
+    目標を書く前に、目標と違う大きい中間の値(既定 240)を書く。
+    イヤホン本体は値が変化する書き込みだけ取り込む疑いがあるため。
     GG が動いていれば GG 経由、無ければ USB の HID へ直接書く。
     使い方と仕組みは README.md、実測の記録は docs/memo.md。
 
@@ -588,6 +590,15 @@ function Resolve-Channel {
     return 'Hid'
 }
 
+# 目標の前に書く中間の値。目標と同じ値では変化にならないので避ける。
+# 大きい値なので、この後の目標の書き込みが途中で失敗しても
+# 自動電源オフはほとんど効かない側に残る。
+function Get-BridgeMinutes {
+    param([int]$Goal)
+    if ($Goal -eq 240) { return 241 }
+    return 240
+}
+
 function Invoke-PollEngine {
     # GG が起動していないと、ここで行く先が決まらない。
     # 分かりにくい URI のエラーではなく、理由を一行で出す。
@@ -638,8 +649,10 @@ function Invoke-PollEngine {
         return 0
     }
 
-    # 現在と同じ値でも毎回書く。
-    Set-CurrentMinutes -Config $cfg -DeviceId $dev.id -Value $Minutes
+    # 中間の値を経由して目標を書く。変更後に出すのは最終の目標だけ。
+    Set-CurrentMinutes -Config $cfg -DeviceId $dev.id -Value (Get-BridgeMinutes $Minutes)
+    Start-Sleep -Milliseconds 800
+    Set-CurrentMinutes -Config (Get-ActiveConfig -DeviceId $dev.id) -DeviceId $dev.id -Value $Minutes
     Start-Sleep -Milliseconds 800
     $after = Get-CurrentMinutes -Config (Get-ActiveConfig -DeviceId $dev.id)
     if ($after -eq $Minutes) {
@@ -679,8 +692,10 @@ function Invoke-PollHid {
         return 0
     }
 
-    # 現在と同じ値でも毎回書く。
+    # 中間の値を経由して目標を書く。書き込みの繰り返しは同じプロセスで効く(実測)。
     try {
+        Write-HidMinutes -Value (Get-BridgeMinutes $Minutes)
+        Start-Sleep -Milliseconds 300
         Write-HidMinutes -Value $Minutes
     } catch {
         Write-Host "理由=HID の書き込みが失敗: $($_.Exception.Message)"
